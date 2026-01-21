@@ -1,15 +1,17 @@
 {
-    "name": "notification_server",
-    "version": "1.0.0",
-    "description": "Simple Notification Server for OneSignal",
-    "main": "server.js",
-    "scripts": {
-        "start": "node server.js"
-    },
-    "dependencies": {
-        "express": "^4.18.2",
-        "cors": "^2.8.5",
-        "axios": "^1.6.2",
-        "body-parser": "^1.20.2"
-    }
+  "name": "notification_server",
+  "version": "1.0.0",
+  "description": "Notification Server for OneSignal with Scheduler",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.8",
+    "body-parser": "^1.20.2",
+    "node-cron": "^3.0.3",
+    "firebase-admin": "^12.0.0"
+  }
 }
