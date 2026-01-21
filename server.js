@@ -11,7 +11,7 @@ const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
-// 🔒 STRICT SECURITY CHECKS
+// 🔒 STRICT SECURITY CHECKS (OneSignal is mandatory)
 if (!ONESIGNAL_APP_ID) {
   console.error("❌ CRITICAL ERROR: ONESIGNAL_APP_ID environment variable is missing.");
   process.exit(1);
@@ -22,17 +22,20 @@ if (!ONESIGNAL_REST_API_KEY) {
   process.exit(1);
 }
 
-// ✅ FIREBASE ADMIN INIT (SERVICE ACCOUNT)
-// Not: Render environment variable 'FIREBASE_SERVICE_ACCOUNT' içinde JSON string olarak saklanmalı
+// ✅ FIREBASE ADMIN INIT (SAFE & OPTIONAL)
+let db = null; // Default to null, only set if init succeeds
+
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
+    db = admin.firestore();
     console.log("🔥 Firebase Admin Initialized with Env Var");
   } catch (e) {
-    console.error("❌ Firebase Env Var Parse Error:", e);
+    console.error("❌ Firebase Env Var Parse Error:", e.message);
+    console.warn("⚠️ Server starting WITHOUT Firebase. DB features will be disabled.");
   }
 } else {
   // Local development fallback
@@ -41,13 +44,13 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
+    db = admin.firestore();
     console.log("🔥 Firebase Admin Initialized with File");
   } catch (e) {
-    console.warn("⚠️ Firebase credentials not found. Scheduler will not work without DB access.");
+    console.warn("⚠️ Firebase credentials not found. Server starting WITHOUT Firebase. DB features will be disabled.");
   }
 }
 
-const db = admin.firestore();
 const app = express();
 
 // Middleware
@@ -64,7 +67,12 @@ app.use((req, res, next) => {
    🏥 HEALTH CHECK
 ================================ */
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: "ok", service: "notification-server", url: SERVER_URL });
+  res.status(200).json({
+    status: "ok",
+    service: "notification-server",
+    url: SERVER_URL,
+    firebase: db ? "connected" : "disconnected"
+  });
 });
 
 /* ================================
@@ -72,6 +80,12 @@ app.get('/health', (req, res) => {
    Her dakika çalışır, zamanı gelen bildirimleri gönderir.
 ================================ */
 cron.schedule('* * * * *', async () => {
+  // 🔒 DB CHECK
+  if (!db) {
+    console.warn("[SCHEDULE] Skipping cron job: Firebase DB not initialized.");
+    return;
+  }
+
   console.log("[SCHEDULE] Checking for pending notifications...");
 
   const now = admin.firestore.Timestamp.now();
@@ -111,7 +125,7 @@ cron.schedule('* * * * *', async () => {
    📮 ENDPOINTS
 ================================ */
 
-// 1. Manuel / Anlık Bildirim
+// 1. Manuel / Anlık Bildirim (DB Bağlantısı gerekmez)
 app.post('/send-notification', async (req, res) => {
   const { userId, title, message } = req.body;
 
@@ -130,6 +144,12 @@ app.post('/send-notification', async (req, res) => {
 
 // 2. Planlı Bildirim (Randevu Alınca Çağrılır)
 app.post('/schedule-notification', async (req, res) => {
+  // 🔒 DB CHECK
+  if (!db) {
+    console.error("[ERROR] Cannot schedule notification: Firebase DB not initialized.");
+    return res.status(503).json({ error: "Service unavailable: Database not connected" });
+  }
+
   const { userId, appointmentId, date, time } = req.body; // date: "2024-01-20", time: "14:30"
 
   if (!userId || !appointmentId || !date || !time) {
@@ -137,12 +157,7 @@ app.post('/schedule-notification', async (req, res) => {
   }
 
   try {
-    // Parse date time
-    // Note: Basit string parsing yapiyoruz, timezone'a dikkat etmek gerekir.
-    // Varsayim: Server ve App ayni timezone (TR saati) veya UTC isliyor.
-    // Daha saglam olmasi icin ISO string gonderilmesi onerilir ama mevcut yapiyi bozmuyoruz.
-
-    const appointmentDateTimeString = `${date}T${time}:00`; // "2024-01-20T14:30:00"
+    const appointmentDateTimeString = `${date}T${time}:00`;
     const appointmentDate = new Date(appointmentDateTimeString);
 
     if (isNaN(appointmentDate.getTime())) {
@@ -223,4 +238,5 @@ async function sendOneSignal(userId, title, message) {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌍 Server URL: ${SERVER_URL}`);
+  if (!db) console.log("⚠️ WARNING: Server running in NO-DATABASE mode.");
 });
