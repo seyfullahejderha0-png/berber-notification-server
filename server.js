@@ -150,7 +150,7 @@ app.post('/schedule-notification', async (req, res) => {
     return res.status(503).json({ error: "Service unavailable: Database not connected" });
   }
 
-  const { userId, appointmentId, date, time } = req.body; // date: "2024-01-20", time: "14:30"
+  const { userId, appointmentId, date, time, staffName } = req.body; // date: "2024-01-20", time: "14:30"
 
   if (!userId || !appointmentId || !date || !time) {
     return res.status(400).json({ error: "Missing fields" });
@@ -172,13 +172,16 @@ app.post('/schedule-notification', async (req, res) => {
 
     const batch = db.batch();
 
+    // Message Customization
+    const staffText = staffName ? ` ${staffName} ile` : "";
+
     // 1 Saat Kala
     const ref1 = db.collection('notification_jobs').doc();
     batch.set(ref1, {
       appointmentId,
       userId,
       title: "⏰ Randevun 1 Saat Sonra",
-      message: "Hazırlanmayı unutma, randevuna 1 saat kaldı.",
+      message: `Hazırlanmayı unutma,${staffText} randevuna 1 saat kaldı.`,
       scheduledAt: admin.firestore.Timestamp.fromDate(job1Date),
       status: 'pending',
       createdAt: admin.firestore.Timestamp.now()
@@ -190,7 +193,7 @@ app.post('/schedule-notification', async (req, res) => {
       appointmentId,
       userId,
       title: "✂️ Randevun Yaklaşıyor",
-      message: "Randevuna 30 dakika kaldı!",
+      message: `Randevuna 30 dakika kaldı!${staffText} seni bekliyor.`,
       scheduledAt: admin.firestore.Timestamp.fromDate(job2Date),
       status: 'pending',
       createdAt: admin.firestore.Timestamp.now()
