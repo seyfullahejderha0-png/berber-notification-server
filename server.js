@@ -232,6 +232,124 @@ cron.schedule('*/5 * * * *', async () => {
 });
 
 /* ================================
+   ⚡ STRICT 1-HOUR REMINDER (DIRECT SEND)
+   Bypasses job queue. Runs every 1 minute.
+   Authority: Server-Side Time Check
+================================ */
+cron.schedule('*/1 * * * *', async () => {
+  // 1. Log Scan Start
+  // Note: We don't have the exact count yet, but we'll log it after query
+  if (!db) return; // Skip if no DB
+
+  const now = new Date();
+
+  try {
+    // strict query: approved AND oneHourReminderSent != true
+    const snapshot = await db.collection('appointments')
+      .where('status', '==', 'approved')
+      .where('oneHourReminderSent', '!=', true)
+      .get();
+
+    if (snapshot.empty) {
+      // Optional: log heartbeat (can be noisy every min, but requested for verification)
+      // User asked: "When scanning: [REMINDER_SCAN] checked: <count> eligible: <count>"
+      // Since we filtered by query, 'checked' is effectively the snapshot size (candidates).
+      console.log(`[REMINDER_SCAN] checked: 0 eligible: 0`);
+      return;
+    }
+
+    let sentCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    const batch = db.batch();
+    let batchCommitNeeded = false;
+
+    console.log(`[REMINDER_SCAN] checked: ${snapshot.size} eligible: ? (calculating)`);
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const appointmentId = doc.id;
+
+      // 1. Re-Verify status (paranoid check)
+      if (data.status !== 'approved') {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: not_approved`);
+        skippedCount++;
+        continue;
+      }
+
+      // 2. Parse Time
+      if (!data.date || !data.time) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: invalid_date_time`);
+        skippedCount++;
+        continue;
+      }
+
+      const apptDateStr = `${data.date}T${data.time}:00`; // "2024-01-25T14:30:00"
+      const apptDate = new Date(apptDateStr);
+
+      if (isNaN(apptDate.getTime())) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: invalid_date_parse`);
+        skippedCount++;
+        continue;
+      }
+
+      // 3. Time Logic
+      // Rule: appointmentTime - now <= 60 minutes AND > 0
+      const diffMs = apptDate.getTime() - now.getTime();
+      const diffMinutes = diffMs / (1000 * 60);
+
+      const isWithin1Hour = diffMinutes <= 60 && diffMinutes > 0;
+
+      if (!isWithin1Hour) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: time_not_in_range (${diffMinutes.toFixed(1)} min left)`);
+        skippedCount++;
+        continue;
+      }
+
+      // 4. Send Notification (DIRECTLY)
+      // "Randevunuza 1 saat kaldı. Geliyor musunuz?"
+      try {
+        const success = await sendOneSignal(
+          data.customerId,
+          "Randevunuza 1 saat kaldı ⏳",
+          "Geliyor musunuz?"
+        );
+
+        if (success) {
+          // 5. Update Firestore Flag (oneHourReminderSent: true)
+          batch.update(doc.ref, { oneHourReminderSent: true });
+          batchCommitNeeded = true;
+          sentCount++;
+
+          console.log(`[REMINDER_SENT] appointmentId: ${appointmentId} customerId: ${data.customerId} appointmentTime: ${apptDateStr}`);
+        } else {
+          // Failed to send via OneSignal
+          console.error(`[REMINDER_FAILED] appointmentId: ${appointmentId} error: OneSignal API failed`);
+          failedCount++;
+        }
+
+      } catch (err) {
+        console.error(`[REMINDER_FAILED] appointmentId: ${appointmentId} error: ${err.message}`);
+        failedCount++;
+      }
+    }
+
+    // 6. Commit Batch
+    if (batchCommitNeeded) {
+      await batch.commit();
+      console.log(`[REMINDER_BATCH_COMMIT] Updated ${sentCount} appointments.`);
+    }
+
+    // Final Summary (Optional but helpful)
+    console.log(`[REMINDER_CYCLE_DONE] sent: ${sentCount} skipped: ${skippedCount} failed: ${failedCount}`);
+
+  } catch (error) {
+    console.error(`[REMINDER_SCAN_ERROR] ${error.message}`);
+  }
+});
+
+/* ================================
    📮 ENDPOINTS
 ================================ */
 
