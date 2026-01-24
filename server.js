@@ -122,6 +122,116 @@ cron.schedule('* * * * *', async () => {
 });
 
 /* ================================
+   🔍 APPOINTMENT SCANNER (CRON)
+   Verifies 1-Hour Reminders & Confirmations are scheduled/sent.
+   Runs every 5 minutes.
+================================ */
+cron.schedule('*/5 * * * *', async () => {
+  console.log("[SCANNER] Starting appointment health check...");
+  const now = new Date();
+
+  // 1. SCHEDULE MISSING REMINDERS
+  try {
+    // Look for approved appointments in future that haven't been scheduled
+    // Note: Firestore query limitations might require client-side filtering for date/time if stored as strings
+    // We assume 'status' == 'approved' and 'reminderScheduled' != true
+    const snapshot = await db.collection('appointments')
+      .where('status', '==', 'approved')
+      .where('reminderScheduled', '!=', true)
+      .limit(50) // Process in batches
+      .get();
+
+    if (!snapshot.empty) {
+      console.log(`[SCANNER] Found ${snapshot.size} approved appointments to check.`);
+      const batch = db.batch();
+      let updateCount = 0;
+
+      for (const doc of snapshot.docs) {
+        const data = doc.data();
+
+        // Parse Date/Time
+        if (!data.date || !data.time) continue;
+        const apptDateStr = `${data.date}T${data.time}:00`;
+        const apptDate = new Date(apptDateStr);
+
+        if (isNaN(apptDate.getTime())) continue;
+
+        // Only schedule if appointment is in the future (> 60 mins from now to be safe, or just future)
+        const diffMs = apptDate.getTime() - now.getTime();
+        const oneHourMs = 60 * 60 * 1000;
+
+        // If appointment is more than 1 hour away, we schedule the reminder
+        if (diffMs > oneHourMs) {
+          const jobDate = new Date(apptDate.getTime() - oneHourMs);
+
+          // Create Notification Job
+          const jobRef = db.collection('notification_jobs').doc();
+          batch.set(jobRef, {
+            appointmentId: doc.id,
+            userId: data.customerId,
+            title: "⏰ Randevun 1 Saat Sonra",
+            message: "Hazırlanmayı unutma, randevuna 1 saat kaldı.",
+            scheduledAt: admin.firestore.Timestamp.fromDate(jobDate),
+            status: 'pending',
+            createdAt: admin.firestore.Timestamp.now()
+          });
+
+          // Mark Appointment as Scheduled
+          batch.update(doc.ref, { reminderScheduled: true });
+
+          console.log(`[REMINDER_SCHEDULED] appointmentId: ${doc.id} scheduledFor: ${jobDate.toISOString()}`);
+          updateCount++;
+        } else if (diffMs > 0) {
+          // Less than 1 hour away but approved? Maybe send immediate or skip?
+          // Mark as 'skipped' so we don't re-query
+          batch.update(doc.ref, { reminderScheduled: true });
+          console.log(`[REMINDER_SKIPPED] Too close: ${doc.id}`);
+          updateCount++;
+        }
+      }
+
+      if (updateCount > 0) {
+        await batch.commit();
+        console.log(`[SCANNER] Scheduled reminders for ${updateCount} appointments.`);
+      }
+    }
+  } catch (e) {
+    console.error("[SCANNER] Error in Reminder Check:", e);
+  }
+
+  // 2. CHECK CUSTOMER CONFIRMATION NOTIFICATIONS
+  try {
+    const confirmSnapshot = await db.collection('appointments')
+      .where('customerConfirmed', '==', true)
+      .where('barberNotified', '!=', true)
+      .limit(20)
+      .get();
+
+    if (!confirmSnapshot.empty) {
+      const batch = db.batch();
+
+      for (const doc of confirmSnapshot.docs) {
+        const data = doc.data();
+        if (!data.barberId) continue;
+
+        // Send Immediate Notification to Barber
+        await sendOneSignal(
+          data.barberId,
+          "Müşteri Geliyor ✅",
+          `${data.customerName || 'Müşteri'}, ${data.appointmentTime || data.time} randevusuna geleceğini onayladı.`
+        );
+
+        batch.update(doc.ref, { barberNotified: true });
+        console.log(`[CONFIRMATION_SENT] To Barber: ${data.barberId} For: ${doc.id}`);
+      }
+      await batch.commit();
+    }
+  } catch (e) {
+    console.error("[SCANNER] Error in Confirmation Check:", e);
+  }
+});
+
+/* ================================
    📮 ENDPOINTS
 ================================ */
 
