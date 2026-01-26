@@ -107,7 +107,14 @@ cron.schedule('* * * * *', async () => {
       console.log(`[SCHEDULE] Processing Job: ${doc.id} -> User: ${job.userId}`);
 
       // Send via OneSignal
-      sendOneSignal(job.userId, job.title, job.message);
+      // Pass buttons and data if they exist in the job document
+      sendOneSignal(
+        job.userId,
+        job.title,
+        job.message,
+        job.buttons || null,
+        job.data || null
+      );
 
       // Mark as sent
       batch.update(doc.ref, { status: 'sent', sentAt: now });
@@ -175,7 +182,7 @@ app.post('/schedule-notification', async (req, res) => {
     // Message Customization
     const staffText = staffName ? ` ${staffName} ile` : "";
 
-    // 1 Saat Kala
+    // 1 Saat Kala - INTERACTIVE BUTTONS
     const ref1 = db.collection('notification_jobs').doc();
     batch.set(ref1, {
       appointmentId,
@@ -184,10 +191,18 @@ app.post('/schedule-notification', async (req, res) => {
       message: `Hazırlanmayı unutma,${staffText} randevuna 1 saat kaldı.`,
       scheduledAt: admin.firestore.Timestamp.fromDate(job1Date),
       status: 'pending',
-      createdAt: admin.firestore.Timestamp.now()
+      createdAt: admin.firestore.Timestamp.now(),
+      // NEW: Interactive Buttons & Data
+      buttons: [
+        { "id": "confirm_yes", "text": "EVET, GELİYORUM" },
+        { "id": "confirm_no", "text": "HAYIR, GELEMEYECEĞİM" }
+      ],
+      data: {
+        "appointmentId": appointmentId
+      }
     });
 
-    // 30 Dk Kala
+    // 30 Dk Kala - REMINDER ONLY
     const ref2 = db.collection('notification_jobs').doc();
     batch.set(ref2, {
       appointmentId,
@@ -197,6 +212,7 @@ app.post('/schedule-notification', async (req, res) => {
       scheduledAt: admin.firestore.Timestamp.fromDate(job2Date),
       status: 'pending',
       createdAt: admin.firestore.Timestamp.now()
+      // No buttons for 30 min reminder
     });
 
     await batch.commit();
@@ -211,19 +227,24 @@ app.post('/schedule-notification', async (req, res) => {
 });
 
 // HELPER: OneSignal Sender
-async function sendOneSignal(userId, title, message) {
+async function sendOneSignal(userId, title, message, buttons = null, data = null) {
   console.log(`[NOTIFY] Sending -> ${userId}: ${title}`);
   try {
+    const payload = {
+      app_id: ONESIGNAL_APP_ID,
+      include_external_user_ids: [userId],
+      headings: { en: title },
+      contents: { en: message },
+      channel_for_external_user_ids: "push",
+      android_accent_color: "FF000000"
+    };
+
+    if (buttons) payload.buttons = buttons;
+    if (data) payload.data = data;
+
     await axios.post(
       "https://onesignal.com/api/v1/notifications",
-      {
-        app_id: ONESIGNAL_APP_ID,
-        include_external_user_ids: [userId],
-        headings: { en: title },
-        contents: { en: message },
-        channel_for_external_user_ids: "push",
-        android_accent_color: "FF000000"
-      },
+      payload,
       {
         headers: {
           "Content-Type": "application/json",
