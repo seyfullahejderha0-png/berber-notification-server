@@ -128,6 +128,13 @@ cron.schedule('* * * * *', async () => {
 ================================ */
 cron.schedule('*/5 * * * *', async () => {
   console.log("[SCANNER] Starting appointment health check...");
+
+  // 🛑 DB SAFETY CHECK
+  if (!db) {
+    console.warn("[SCANNER] Skipping check: Database not connected.");
+    return;
+  }
+
   const now = new Date();
 
   // 1. SCHEDULE MISSING REMINDERS
