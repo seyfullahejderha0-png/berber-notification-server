@@ -107,14 +107,7 @@ cron.schedule('* * * * *', async () => {
       console.log(`[SCHEDULE] Processing Job: ${doc.id} -> User: ${job.userId}`);
 
       // Send via OneSignal
-      // Pass buttons and data if they exist in the job document
-      sendOneSignal(
-        job.userId,
-        job.title,
-        job.message,
-        job.buttons || null,
-        job.data || null
-      );
+      sendOneSignal(job.userId, job.title, job.message);
 
       // Mark as sent
       batch.update(doc.ref, { status: 'sent', sentAt: now });
@@ -129,7 +122,293 @@ cron.schedule('* * * * *', async () => {
 });
 
 /* ================================
-    ENDPOINTS
+   🔍 APPOINTMENT SCANNER (CRON)
+   Verifies 1-Hour Reminders & Confirmations are scheduled/sent.
+   Runs every 5 minutes.
+================================ */
+cron.schedule('*/5 * * * *', async () => {
+  console.log("[SCANNER] Starting appointment health check...");
+  const now = new Date();
+
+  // 1. SCHEDULE MISSING REMINDERS
+  try {
+    // Look for approved appointments in future that haven't been scheduled
+    // Note: Firestore query limitations might require client-side filtering for date/time if stored as strings
+    // We assume 'status' == 'approved' and 'reminderScheduled' != true
+    // Generate Unpadded Date Strings (YYYY-M-D) for Today and Tomorrow
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const todayStr = `${today.getFullYear()}-${today.getMonth() + 1}-${today.getDate()}`;
+    const tomorrowStr = `${tomorrow.getFullYear()}-${tomorrow.getMonth() + 1}-${tomorrow.getDate()}`;
+
+    // Query both days to cover late-night/early-morning edge cases
+    const todaySnapshot = await db.collection('appointments')
+      .where('status', '==', 'approved')
+      .where('date', '==', todayStr)
+      .get();
+
+    const tomorrowSnapshot = await db.collection('appointments')
+      .where('status', '==', 'approved')
+      .where('date', '==', tomorrowStr)
+      .get();
+
+    const allDocs = [...todaySnapshot.docs, ...tomorrowSnapshot.docs];
+
+    if (allDocs.length > 0) {
+      console.log(`[SCANNER] Found ${allDocs.length} approved appointments for Today/Tomorrow.`);
+      const batch = db.batch();
+      let updateCount = 0;
+
+      for (const doc of allDocs) {
+        const data = doc.data();
+
+        // 🛑 MEMORY CHECK: Skip if already scheduled
+        if (data.reminderScheduled === true) continue;
+
+        // SKIP if old appointment (double check time logic below handles this)
+
+        // Parse Date/Time (Assuming UTC+3 for Turkey)
+        if (!data.date || !data.time) continue;
+
+        // FIX: Pad date parts (YYYY-M-D -> YYYY-MM-DD) for JS Date compatibility
+        const [sYear, sMonth, sDay] = data.date.split('-');
+        const paddedDate = `${sYear}-${sMonth.padStart(2, '0')}-${sDay.padStart(2, '0')}`;
+
+        const apptDateStr = `${paddedDate}T${data.time}:00+03:00`;
+        const apptDate = new Date(apptDateStr);
+
+        if (isNaN(apptDate.getTime())) continue;
+
+        const diffMs = apptDate.getTime() - now.getTime();
+        const oneHourMs = 60 * 60 * 1000;
+        const thirtyMinMs = 30 * 60 * 1000;
+
+        let jobsCreated = 0;
+
+        // RULE 1: Schedule 1-Hour Reminder if > 60 mins away
+        if (diffMs > oneHourMs) {
+          const jobDate = new Date(apptDate.getTime() - oneHourMs);
+          const jobRef = db.collection('notification_jobs').doc();
+          batch.set(jobRef, {
+            appointmentId: doc.id,
+            userId: data.customerId,
+            title: "⏰ Randevun 1 Saat Sonra",
+            message: "Hazırlanmayı unutma, randevuna 1 saat kaldı.",
+            scheduledAt: admin.firestore.Timestamp.fromDate(jobDate),
+            status: 'pending',
+            createdAt: admin.firestore.Timestamp.now()
+          });
+          jobsCreated++;
+        }
+
+        // RULE 2: Schedule 30-Min Reminder if > 30 mins away
+        // (Even if we missed the 1-hour mark, we still want this if possible)
+        if (diffMs > thirtyMinMs) {
+          const jobDate2 = new Date(apptDate.getTime() - thirtyMinMs);
+
+          // Only schedule distinct job if it's in the future
+          // The diff check guarantees it's > 30 mins from NOW, so the trigger time (Target - 30m) is in the future.
+          const jobRef2 = db.collection('notification_jobs').doc();
+          batch.set(jobRef2, {
+            appointmentId: doc.id,
+            userId: data.customerId,
+            title: "✂️ Randevun Yaklaşıyor",
+            message: "Randevuna 30 dakika kaldı!",
+            scheduledAt: admin.firestore.Timestamp.fromDate(jobDate2),
+            status: 'pending',
+            createdAt: admin.firestore.Timestamp.now()
+          });
+          jobsCreated++;
+        }
+
+        // Always mark as scheduled so we don't process this doc again
+        // (If < 30 mins, we missed the window for scheduled jobs. Strict scanner might catch 1h logic, but 30m is lost. This is expected behavior for very late bookings)
+        batch.update(doc.ref, { reminderScheduled: true });
+
+        if (jobsCreated > 0) {
+          console.log(`[REMINDER_SCHEDULED] appointmentId: ${doc.id} jobs: ${jobsCreated}`);
+          updateCount++;
+        } else {
+          console.log(`[REMINDER_SKIPPED] Too close for scheduled jobs: ${doc.id}`);
+          // We still count this as an update to clear the pending state
+          updateCount++;
+        }
+      }
+
+      if (updateCount > 0) {
+        await batch.commit();
+        console.log(`[SCANNER] Processed reminders for ${updateCount} appointments.`);
+      }
+    }
+  } catch (e) {
+    console.error("[SCANNER] Error in Reminder Check:", e);
+  }
+
+  // 2. CHECK CUSTOMER CONFIRMATION NOTIFICATIONS
+  try {
+    const confirmSnapshot = await db.collection('appointments')
+      .where('customerConfirmed', '==', true)
+      .where('barberNotified', '!=', true)
+      .limit(20)
+      .get();
+
+    if (!confirmSnapshot.empty) {
+      const batch = db.batch();
+
+      for (const doc of confirmSnapshot.docs) {
+        const data = doc.data();
+        if (!data.barberId) continue;
+
+        // Send Immediate Notification to Barber
+        await sendOneSignal(
+          data.barberId,
+          "Müşteri Geliyor ✅",
+          `${data.customerName || 'Müşteri'}, ${data.appointmentTime || data.time} randevusuna geleceğini onayladı.`
+        );
+
+        batch.update(doc.ref, { barberNotified: true });
+        console.log(`[CONFIRMATION_SENT] To Barber: ${data.barberId} For: ${doc.id}`);
+      }
+      await batch.commit();
+    }
+  } catch (e) {
+    console.error("[SCANNER] Error in Confirmation Check:", e);
+  }
+});
+
+/* ================================
+   ⚡ STRICT 1-HOUR REMINDER (DIRECT SEND)
+   Bypasses job queue. Runs every 1 minute.
+   Authority: Server-Side Time Check
+================================ */
+cron.schedule('*/1 * * * *', async () => {
+  // 1. Log Scan Start
+  // Note: We don't have the exact count yet, but we'll log it after query
+  if (!db) return; // Skip if no DB
+
+  const now = new Date();
+
+  try {
+    // Generate Unpadded Date String (YYYY-M-D)
+    // Format: 2026-1-31 (No leading zeros for month/day based on user data)
+    const dateStr = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+
+    // Query ONLY today's approved appointments
+    // We remove .where('oneHourReminderSent', '!=', true) to find docs where field is missing
+    const snapshot = await db.collection('appointments')
+      .where('status', '==', 'approved')
+      .where('date', '==', dateStr)
+      .get();
+
+    if (snapshot.empty) {
+      console.log(`[REMINDER_SCAN] checked: 0 eligible: 0 (Date: ${dateStr})`);
+      return;
+    }
+
+    let sentCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    const batch = db.batch();
+    let batchCommitNeeded = false;
+
+    console.log(`[REMINDER_SCAN] checked: ${snapshot.size} eligible: ? (calculating)`);
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const appointmentId = doc.id;
+
+      // 1. Re-Verify status (paranoid check)
+      if (data.status !== 'approved') {
+        skippedCount++;
+        continue;
+      }
+
+      // 🛑 IN-MEMORY CHECK: Skip if already sent
+      if (data.oneHourReminderSent === true) {
+        // console.log(`[REMINDER_SKIPPED] already sent: ${appointmentId}`); // Too noisy
+        continue;
+      }
+
+      // 2. Parse Time
+      if (!data.date || !data.time) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: invalid_date_time`);
+        skippedCount++;
+        continue;
+      }
+
+      // FIX: Pad date parts
+      const [sYear, sMonth, sDay] = data.date.split('-');
+      const paddedDate = `${sYear}-${sMonth.padStart(2, '0')}-${sDay.padStart(2, '0')}`;
+
+      const apptDateStr = `${paddedDate}T${data.time}:00+03:00`; // "2024-01-25T14:30:00+03:00"
+      const apptDate = new Date(apptDateStr);
+
+      if (isNaN(apptDate.getTime())) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: invalid_date_parse`);
+        skippedCount++;
+        continue;
+      }
+
+      // 3. Time Logic
+      // Rule: appointmentTime - now <= 60 minutes AND > 0
+      const diffMs = apptDate.getTime() - now.getTime();
+      const diffMinutes = diffMs / (1000 * 60);
+
+      const isWithin1Hour = diffMinutes <= 60 && diffMinutes > 0;
+
+      if (!isWithin1Hour) {
+        console.log(`[REMINDER_SKIPPED] appointmentId: ${appointmentId} reason: time_not_in_range (${diffMinutes.toFixed(1)} min left)`);
+        skippedCount++;
+        continue;
+      }
+
+      // 4. Send Notification (DIRECTLY)
+      // "Randevunuza 1 saat kaldı. Geliyor musunuz?"
+      try {
+        const success = await sendOneSignal(
+          data.customerId,
+          "Randevunuza 1 saat kaldı ⏳",
+          "Geliyor musunuz?"
+        );
+
+        if (success) {
+          // 5. Update Firestore Flag (oneHourReminderSent: true)
+          batch.update(doc.ref, { oneHourReminderSent: true });
+          batchCommitNeeded = true;
+          sentCount++;
+
+          console.log(`[REMINDER_SENT] appointmentId: ${appointmentId} customerId: ${data.customerId} appointmentTime: ${apptDateStr}`);
+        } else {
+          // Failed to send via OneSignal
+          console.error(`[REMINDER_FAILED] appointmentId: ${appointmentId} error: OneSignal API failed`);
+          failedCount++;
+        }
+
+      } catch (err) {
+        console.error(`[REMINDER_FAILED] appointmentId: ${appointmentId} error: ${err.message}`);
+        failedCount++;
+      }
+    }
+
+    // 6. Commit Batch
+    if (batchCommitNeeded) {
+      await batch.commit();
+      console.log(`[REMINDER_BATCH_COMMIT] Updated ${sentCount} appointments.`);
+    }
+
+    // Final Summary (Optional but helpful)
+    console.log(`[REMINDER_CYCLE_DONE] sent: ${sentCount} skipped: ${skippedCount} failed: ${failedCount}`);
+
+  } catch (error) {
+    console.error(`[REMINDER_SCAN_ERROR] ${error.message}`);
+  }
+});
+
+/* ================================
+   📮 ENDPOINTS
 ================================ */
 
 // 1. Manuel / Anlık Bildirim (DB Bağlantısı gerekmez)
@@ -157,14 +436,18 @@ app.post('/schedule-notification', async (req, res) => {
     return res.status(503).json({ error: "Service unavailable: Database not connected" });
   }
 
-  const { userId, appointmentId, date, time, staffName } = req.body; // date: "2024-01-20", time: "14:30"
+  const { userId, appointmentId, date, time } = req.body; // date: "2024-01-20", time: "14:30"
 
   if (!userId || !appointmentId || !date || !time) {
     return res.status(400).json({ error: "Missing fields" });
   }
 
   try {
-    const appointmentDateTimeString = `${date}T${time}:00`;
+    // FIX: Pad date parts
+    const [sYear, sMonth, sDay] = date.split('-');
+    const paddedDate = `${sYear}-${sMonth.padStart(2, '0')}-${sDay.padStart(2, '0')}`;
+
+    const appointmentDateTimeString = `${paddedDate}T${time}:00+03:00`;
     const appointmentDate = new Date(appointmentDateTimeString);
 
     if (isNaN(appointmentDate.getTime())) {
@@ -179,40 +462,28 @@ app.post('/schedule-notification', async (req, res) => {
 
     const batch = db.batch();
 
-    // Message Customization
-    const staffText = staffName ? ` ${staffName} ile` : "";
-
-    // 1 Saat Kala - INTERACTIVE BUTTONS
+    // 1 Saat Kala
     const ref1 = db.collection('notification_jobs').doc();
     batch.set(ref1, {
       appointmentId,
       userId,
       title: "⏰ Randevun 1 Saat Sonra",
-      message: `Hazırlanmayı unutma,${staffText} randevuna 1 saat kaldı.`,
+      message: "Hazırlanmayı unutma, randevuna 1 saat kaldı.",
       scheduledAt: admin.firestore.Timestamp.fromDate(job1Date),
       status: 'pending',
-      createdAt: admin.firestore.Timestamp.now(),
-      // NEW: Interactive Buttons & Data
-      buttons: [
-        { "id": "confirm_yes", "text": "EVET, GELİYORUM" },
-        { "id": "confirm_no", "text": "HAYIR, GELEMEYECEĞİM" }
-      ],
-      data: {
-        "appointmentId": appointmentId
-      }
+      createdAt: admin.firestore.Timestamp.now()
     });
 
-    // 30 Dk Kala - REMINDER ONLY
+    // 30 Dk Kala
     const ref2 = db.collection('notification_jobs').doc();
     batch.set(ref2, {
       appointmentId,
       userId,
       title: "✂️ Randevun Yaklaşıyor",
-      message: `Randevuna 30 dakika kaldı!${staffText} seni bekliyor.`,
+      message: "Randevuna 30 dakika kaldı!",
       scheduledAt: admin.firestore.Timestamp.fromDate(job2Date),
       status: 'pending',
       createdAt: admin.firestore.Timestamp.now()
-      // No buttons for 30 min reminder
     });
 
     await batch.commit();
@@ -227,24 +498,19 @@ app.post('/schedule-notification', async (req, res) => {
 });
 
 // HELPER: OneSignal Sender
-async function sendOneSignal(userId, title, message, buttons = null, data = null) {
+async function sendOneSignal(userId, title, message) {
   console.log(`[NOTIFY] Sending -> ${userId}: ${title}`);
   try {
-    const payload = {
-      app_id: ONESIGNAL_APP_ID,
-      include_external_user_ids: [userId],
-      headings: { en: title },
-      contents: { en: message },
-      channel_for_external_user_ids: "push",
-      android_accent_color: "FF000000"
-    };
-
-    if (buttons) payload.buttons = buttons;
-    if (data) payload.data = data;
-
     await axios.post(
       "https://onesignal.com/api/v1/notifications",
-      payload,
+      {
+        app_id: ONESIGNAL_APP_ID,
+        include_external_user_ids: [userId],
+        headings: { en: title },
+        contents: { en: message },
+        channel_for_external_user_ids: "push",
+        android_accent_color: "FF000000"
+      },
       {
         headers: {
           "Content-Type": "application/json",
