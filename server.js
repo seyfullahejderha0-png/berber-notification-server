@@ -228,6 +228,21 @@ cron.schedule('*/5 * * * *', async () => {
             createdAt: admin.firestore.Timestamp.now()
           });
           jobsCreated++;
+
+          const targetUserId = data.staffId || data.barberId;
+          if (targetUserId) {
+            const jobRefBarber = db.collection('notification_jobs').doc();
+            batch.set(jobRefBarber, {
+              appointmentId: doc.id,
+              userId: targetUserId,
+              title: "🔔 Sıradaki Müşteri",
+              message: `${data.customerName || 'Müşteri'} randevusuna 30 dakika kaldı.`,
+              scheduledAt: admin.firestore.Timestamp.fromDate(jobDate2),
+              status: 'pending',
+              createdAt: admin.firestore.Timestamp.now()
+            });
+            jobsCreated++;
+          }
         }
 
         // Always mark as scheduled so we don't process this doc again
@@ -481,7 +496,7 @@ app.post('/schedule-notification', async (req, res) => {
       createdAt: admin.firestore.Timestamp.now()
     });
 
-    // 30 Dk Kala
+    // 30 Dk Kala (Müşteriye)
     const ref2 = db.collection('notification_jobs').doc();
     batch.set(ref2, {
       appointmentId,
@@ -492,6 +507,29 @@ app.post('/schedule-notification', async (req, res) => {
       status: 'pending',
       createdAt: admin.firestore.Timestamp.now()
     });
+
+    // 30 Dk Kala (Personele / Berbere)
+    try {
+      const apptDoc = await db.collection('appointments').doc(appointmentId).get();
+      if (apptDoc.exists) {
+        const apptData = apptDoc.data();
+        const targetUserId = apptData.staffId || apptData.barberId;
+        if (targetUserId) {
+          const refBarber = db.collection('notification_jobs').doc();
+          batch.set(refBarber, {
+            appointmentId,
+            userId: targetUserId,
+            title: "🔔 Sıradaki Müşteri",
+            message: `${apptData.customerName || 'Müşteri'} randevusuna 30 dakika kaldı.`,
+            scheduledAt: admin.firestore.Timestamp.fromDate(job2Date),
+            status: 'pending',
+            createdAt: admin.firestore.Timestamp.now()
+          });
+        }
+      }
+    } catch (e) {
+      console.error("[SCHEDULE] Failed to fetch appointment for barber notification:", e);
+    }
 
     await batch.commit();
 
